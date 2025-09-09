@@ -1,10 +1,16 @@
 # Module static-server-node
 
-Provide a description of the purpose of the module and any relevant information.
+A module to build and serve static HTML, building with node first.
 
 ## Model viam:static-server-node:server
 
-Provide a description of the model and any relevant information.
+The static server. Upon creation, this server will
+
+1. Download node (or use already downloaded version)
+1. Locate the project directory, downloading if remote
+   - Currently, only remote Github repositories are supported
+1. Build the project using the `build_command` attribute in the config (defaulting to `npm run build`)
+1. Serve the built output from the `build_dir` directory (defaulting to `./dist`) at the specified `port` (defaulting to `8888`)
 
 ### Configuration
 
@@ -12,8 +18,12 @@ The following attribute template can be used to configure this model:
 
 ```json
 {
-"attribute_1": <float>,
-"attribute_2": <string>
+  "path": <string>,
+  "access_token": <string>,
+  "node_version": <string>,
+  "build_command": <string>,
+  "build_dir": <string>,
+  "port": <int>
 }
 ```
 
