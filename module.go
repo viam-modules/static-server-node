@@ -355,13 +355,19 @@ func (s *staticServerNodeServer) buildAndGetFS(ctx context.Context, nodeDir stri
 		return nil, err
 	}
 
+	npx := filepath.Join(nodeDir, "bin", "npx")
+	if runtime.GOOS == "windows" {
+		npm = filepath.Join(nodeDir, "npx")
+	}
 	buildCommand := "build"
 	if !isStringRefEmpty(s.cfg.BuildCommand) {
 		buildCommand = *s.cfg.BuildCommand
 	}
-	buildCommand = "run " + buildCommand
+
+	envVars := generateEnvVars(projectDir)
+	buildCommand = fmt.Sprintf("--yes cross-env %s %s run %s", envVars, npm, buildCommand)
 	args := strings.Split(buildCommand, " ")
-	buildCmd := exec.Command(npm, args...)
+	buildCmd := exec.Command(npx, args...)
 	buildCmd.Dir = projectDir
 	s.logger.Debugf("Building with \"npm %s\"...", buildCommand)
 	err = buildCmd.Run()
@@ -380,6 +386,30 @@ func (s *staticServerNodeServer) buildAndGetFS(ctx context.Context, nodeDir stri
 	}
 
 	return os.DirFS(buildDir), nil
+}
+
+func generateEnvVars(projectDir string) string {
+	envVarPrefix := ""
+	builder := getBuilder(projectDir)
+	if builder == "vite" {
+		envVarPrefix = "VITE_"
+	}
+	return fmt.Sprintf("%sVIAM_API_KEY=%s %sVIAM_API_KEY_ID=%s", envVarPrefix, os.Getenv("VIAM_API_KEY"), envVarPrefix, os.Getenv("VIAM_API_KEY_ID"))
+}
+
+func getBuilder(projectDir string) string {
+	packageJsonBytes, err := os.ReadFile(projectDir + "package.json")
+	if err != nil {
+		return "vite"
+	}
+	packageJson := string(packageJsonBytes)
+	if strings.Contains(packageJson, "rollup") {
+		return "rollup"
+	}
+	if strings.Contains(packageJson, "wepback") {
+		return "webpack"
+	}
+	return "vite"
 }
 
 func isStringRefEmpty(str *string) bool {
