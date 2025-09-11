@@ -35,12 +35,13 @@ func init() {
 }
 
 type Config struct {
-	Path         string  `json:"path"`
-	AccessToken  *string `json:"access_token,omitempty"`
-	NodeVersion  *string `json:"node_version,omitempty"`
-	BuildCommand *string `json:"build_command,omitempty"`
-	BuildDir     *string `json:"build_directory,omitempty"`
-	Port         *int    `json:"port,omitempty"`
+	Path         string            `json:"path"`
+	AccessToken  string            `json:"access_token,omitempty"`
+	NodeVersion  string            `json:"node_version,omitempty"`
+	BuildCommand string            `json:"build_command,omitempty"`
+	BuildDir     string            `json:"build_directory,omitempty"`
+	EnvVars      map[string]string `json:"env_vars,omitempty"`
+	Port         *int              `json:"port,omitempty"`
 }
 
 func (cfg *Config) Validate(path string) ([]string, []string, error) {
@@ -139,8 +140,8 @@ func (s *staticServerNodeServer) getNodeURL() string {
 
 func (s *staticServerNodeServer) getNodeVersion() string {
 	nodeVersion := "22.19.0"
-	if !isStringRefEmpty(s.cfg.NodeVersion) {
-		nodeVersion = *s.cfg.NodeVersion
+	if strings.TrimSpace(s.cfg.NodeVersion) != "" {
+		nodeVersion = s.cfg.NodeVersion
 	}
 	if !strings.HasPrefix(nodeVersion, "v") {
 		nodeVersion = "v" + nodeVersion
@@ -303,8 +304,8 @@ func (s *staticServerNodeServer) downloadGitRepo(ctx context.Context) (string, e
 
 	client := grab.NewClient()
 	req, err := grab.NewRequest(cacheDir, gitUrl)
-	if !isStringRefEmpty(s.cfg.AccessToken) {
-		req.HTTPRequest.Header.Add("Authorization", "token "+strings.TrimSpace(*s.cfg.AccessToken))
+	if strings.TrimSpace(s.cfg.AccessToken) != "" {
+		req.HTTPRequest.Header.Add("Authorization", "token "+strings.TrimSpace(s.cfg.AccessToken))
 	}
 	if err != nil {
 		return "", err
@@ -347,6 +348,7 @@ func (s *staticServerNodeServer) buildAndGetFS(ctx context.Context, nodeDir stri
 	if runtime.GOOS == "windows" {
 		npm = filepath.Join(nodeDir, "npm")
 	}
+
 	installCmd := exec.Command(npm, "install")
 	installCmd.Dir = projectDir
 	s.logger.Debug("Installing npm packages...")
@@ -355,20 +357,19 @@ func (s *staticServerNodeServer) buildAndGetFS(ctx context.Context, nodeDir stri
 		return nil, err
 	}
 
-	npx := filepath.Join(nodeDir, "bin", "npx")
-	if runtime.GOOS == "windows" {
-		npm = filepath.Join(nodeDir, "npx")
-	}
 	buildCommand := "build"
-	if !isStringRefEmpty(s.cfg.BuildCommand) {
-		buildCommand = *s.cfg.BuildCommand
+	if strings.TrimSpace(s.cfg.BuildCommand) != "" {
+		buildCommand = s.cfg.BuildCommand
 	}
-
-	envVars := generateEnvVars(projectDir)
-	buildCommand = fmt.Sprintf("--yes cross-env %s %s run %s", envVars, npm, buildCommand)
-	args := strings.Split(buildCommand, " ")
-	buildCmd := exec.Command(npx, args...)
+	buildCmd := exec.Command(npm, "run", buildCommand)
 	buildCmd.Dir = projectDir
+	buildCmd.Env = s.generateEnvVars()
+
+	// Add custom downloaded node directory to PATH
+	nodeBin := filepath.Dir(npm)
+	newPath := fmt.Sprintf("%s%c%s", nodeBin, os.PathListSeparator, os.Getenv("PATH"))
+	buildCmd.Env = append(buildCmd.Env, "PATH="+newPath)
+
 	s.logger.Debugf("Building with \"npm %s\"...", buildCommand)
 	err = buildCmd.Run()
 	if err != nil {
@@ -376,8 +377,8 @@ func (s *staticServerNodeServer) buildAndGetFS(ctx context.Context, nodeDir stri
 	}
 
 	buildDir := "dist"
-	if !isStringRefEmpty(s.cfg.BuildDir) {
-		buildDir = *s.cfg.BuildDir
+	if strings.TrimSpace(s.cfg.BuildDir) != "" {
+		buildDir = s.cfg.BuildDir
 	}
 	buildDir = filepath.Join(projectDir, buildDir)
 	_, err = os.Stat(buildDir)
@@ -388,28 +389,19 @@ func (s *staticServerNodeServer) buildAndGetFS(ctx context.Context, nodeDir stri
 	return os.DirFS(buildDir), nil
 }
 
-func generateEnvVars(projectDir string) string {
-	envVarPrefix := ""
-	builder := getBuilder(projectDir)
-	if builder == "vite" {
-		envVarPrefix = "VITE_"
+func (s *staticServerNodeServer) generateEnvVars() []string {
+	envVars := []string{}
+	for _, envVar := range os.Environ() {
+		if strings.HasPrefix(envVar, "VIAM_") {
+			envVars = append(envVars, envVar)
+			envVars = append(envVars, "VITE_"+envVar)
+		}
 	}
-	return fmt.Sprintf("%sVIAM_API_KEY=%s %sVIAM_API_KEY_ID=%s", envVarPrefix, os.Getenv("VIAM_API_KEY"), envVarPrefix, os.Getenv("VIAM_API_KEY_ID"))
-}
-
-func getBuilder(projectDir string) string {
-	packageJsonBytes, err := os.ReadFile(projectDir + "package.json")
-	if err != nil {
-		return "vite"
+	for key, value := range s.cfg.EnvVars {
+		envVars = append(envVars, fmt.Sprintf("%s=%s", key, value))
+		envVars = append(envVars, fmt.Sprintf("VITE_%s=%s", key, value))
 	}
-	packageJson := string(packageJsonBytes)
-	if strings.Contains(packageJson, "rollup") {
-		return "rollup"
-	}
-	if strings.Contains(packageJson, "wepback") {
-		return "webpack"
-	}
-	return "vite"
+	return envVars
 }
 
 func isStringRefEmpty(str *string) bool {
