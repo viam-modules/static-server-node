@@ -48,9 +48,6 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	if len(strings.TrimSpace(cfg.Path)) == 0 {
 		return nil, nil, errors.New("path is required")
 	}
-	if !strings.HasPrefix(cfg.Path, "git+") {
-		return nil, nil, errors.New("only git paths are currently supported")
-	}
 	return nil, nil, nil
 }
 
@@ -244,6 +241,7 @@ Loop:
 }
 
 func (s *staticServerNodeServer) getProjectDir(ctx context.Context) (string, error) {
+	// remote git paths
 	if strings.HasPrefix(s.cfg.Path, "git+") {
 		gitDir, err := s.downloadGitRepo(ctx)
 		if err != nil {
@@ -251,7 +249,25 @@ func (s *staticServerNodeServer) getProjectDir(ctx context.Context) (string, err
 		}
 		return gitDir, nil
 	}
-	return "", errors.New("UNREACHABLE CODE PATH")
+
+	// filepath
+	stats, err := os.Stat(s.cfg.Path)
+	if err != nil {
+		return "", err
+	}
+	if !stats.IsDir() {
+		return "", errors.New("path is not a directory")
+	}
+	cacheDir, err := s.getCacheDir()
+	if err != nil {
+		return "", err
+	}
+	projectPath := filepath.Join(cacheDir, fmt.Sprintf("%s-%d", filepath.Base(s.cfg.Path), time.Now().Unix()))
+	err = os.CopyFS(projectPath, os.DirFS(s.cfg.Path))
+	if err != nil {
+		return "", err
+	}
+	return projectPath, nil
 }
 
 type gitURLInfo struct {
@@ -344,6 +360,12 @@ Loop:
 }
 
 func (s *staticServerNodeServer) buildAndGetFS(ctx context.Context, nodeDir string, projectDir string) (fs.FS, error) {
+	cmdLogFile, err := os.CreateTemp("", s.name.Name+"-logs.txt")
+	if err != nil {
+		return nil, err
+	}
+	defer cmdLogFile.Close()
+
 	npm := filepath.Join(nodeDir, "bin", "npm")
 	if runtime.GOOS == "windows" {
 		npm = filepath.Join(nodeDir, "npm")
@@ -351,10 +373,12 @@ func (s *staticServerNodeServer) buildAndGetFS(ctx context.Context, nodeDir stri
 
 	installCmd := exec.Command(npm, "install")
 	installCmd.Dir = projectDir
+	installCmd.Stdout = cmdLogFile
+	installCmd.Stderr = cmdLogFile
 	s.logger.Debug("Installing npm packages...")
-	err := installCmd.Run()
+	err = installCmd.Run()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error installing npm packages. logs are available at %s. %w", cmdLogFile.Name(), err)
 	}
 
 	buildCommand := "build"
@@ -364,6 +388,8 @@ func (s *staticServerNodeServer) buildAndGetFS(ctx context.Context, nodeDir stri
 	buildCmd := exec.Command(npm, "run", buildCommand)
 	buildCmd.Dir = projectDir
 	buildCmd.Env = s.generateEnvVars()
+	buildCmd.Stdout = cmdLogFile
+	buildCmd.Stderr = cmdLogFile
 
 	// Add custom downloaded node directory to PATH
 	nodeBin := filepath.Dir(npm)
@@ -373,7 +399,7 @@ func (s *staticServerNodeServer) buildAndGetFS(ctx context.Context, nodeDir stri
 	s.logger.Debugf("Building with \"npm %s\"...", buildCommand)
 	err = buildCmd.Run()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error building. logs are available at %s. %w", cmdLogFile.Name(), err)
 	}
 
 	buildDir := "dist"
