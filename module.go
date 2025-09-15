@@ -35,20 +35,18 @@ func init() {
 }
 
 type Config struct {
-	Path         string  `json:"path"`
-	AccessToken  *string `json:"access_token,omitempty"`
-	NodeVersion  *string `json:"node_version,omitempty"`
-	BuildCommand *string `json:"build_command,omitempty"`
-	BuildDir     *string `json:"build_directory,omitempty"`
-	Port         *int    `json:"port,omitempty"`
+	Path         string            `json:"path"`
+	AccessToken  string            `json:"access_token,omitempty"`
+	NodeVersion  string            `json:"node_version,omitempty"`
+	BuildCommand string            `json:"build_command,omitempty"`
+	BuildDir     string            `json:"build_directory,omitempty"`
+	EnvVars      map[string]string `json:"env_vars,omitempty"`
+	Port         *int              `json:"port,omitempty"`
 }
 
 func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	if len(strings.TrimSpace(cfg.Path)) == 0 {
 		return nil, nil, errors.New("path is required")
-	}
-	if !strings.HasPrefix(cfg.Path, "git+") {
-		return nil, nil, errors.New("only git paths are currently supported")
 	}
 	return nil, nil, nil
 }
@@ -139,8 +137,8 @@ func (s *staticServerNodeServer) getNodeURL() string {
 
 func (s *staticServerNodeServer) getNodeVersion() string {
 	nodeVersion := "22.19.0"
-	if !isStringRefEmpty(s.cfg.NodeVersion) {
-		nodeVersion = *s.cfg.NodeVersion
+	if strings.TrimSpace(s.cfg.NodeVersion) != "" {
+		nodeVersion = s.cfg.NodeVersion
 	}
 	if !strings.HasPrefix(nodeVersion, "v") {
 		nodeVersion = "v" + nodeVersion
@@ -243,6 +241,7 @@ Loop:
 }
 
 func (s *staticServerNodeServer) getProjectDir(ctx context.Context) (string, error) {
+	// remote git paths
 	if strings.HasPrefix(s.cfg.Path, "git+") {
 		gitDir, err := s.downloadGitRepo(ctx)
 		if err != nil {
@@ -250,7 +249,25 @@ func (s *staticServerNodeServer) getProjectDir(ctx context.Context) (string, err
 		}
 		return gitDir, nil
 	}
-	return "", errors.New("UNREACHABLE CODE PATH")
+
+	// filepath
+	stats, err := os.Stat(s.cfg.Path)
+	if err != nil {
+		return "", err
+	}
+	if !stats.IsDir() {
+		return "", errors.New("path is not a directory")
+	}
+	cacheDir, err := s.getCacheDir()
+	if err != nil {
+		return "", err
+	}
+	projectPath := filepath.Join(cacheDir, fmt.Sprintf("%s-%d", filepath.Base(s.cfg.Path), time.Now().Unix()))
+	err = os.CopyFS(projectPath, os.DirFS(s.cfg.Path))
+	if err != nil {
+		return "", err
+	}
+	return projectPath, nil
 }
 
 type gitURLInfo struct {
@@ -303,8 +320,8 @@ func (s *staticServerNodeServer) downloadGitRepo(ctx context.Context) (string, e
 
 	client := grab.NewClient()
 	req, err := grab.NewRequest(cacheDir, gitUrl)
-	if !isStringRefEmpty(s.cfg.AccessToken) {
-		req.HTTPRequest.Header.Add("Authorization", "token "+strings.TrimSpace(*s.cfg.AccessToken))
+	if strings.TrimSpace(s.cfg.AccessToken) != "" {
+		req.HTTPRequest.Header.Add("Authorization", "token "+strings.TrimSpace(s.cfg.AccessToken))
 	}
 	if err != nil {
 		return "", err
@@ -343,35 +360,51 @@ Loop:
 }
 
 func (s *staticServerNodeServer) buildAndGetFS(ctx context.Context, nodeDir string, projectDir string) (fs.FS, error) {
+	cmdLogFile, err := os.CreateTemp("", s.name.Name+"-logs.txt")
+	if err != nil {
+		return nil, err
+	}
+	defer cmdLogFile.Close()
+
 	npm := filepath.Join(nodeDir, "bin", "npm")
 	if runtime.GOOS == "windows" {
 		npm = filepath.Join(nodeDir, "npm")
 	}
+
 	installCmd := exec.Command(npm, "install")
 	installCmd.Dir = projectDir
+	installCmd.Stdout = cmdLogFile
+	installCmd.Stderr = cmdLogFile
 	s.logger.Debug("Installing npm packages...")
-	err := installCmd.Run()
+	err = installCmd.Run()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error installing npm packages. logs are available at %s. %w", cmdLogFile.Name(), err)
 	}
 
 	buildCommand := "build"
-	if !isStringRefEmpty(s.cfg.BuildCommand) {
-		buildCommand = *s.cfg.BuildCommand
+	if strings.TrimSpace(s.cfg.BuildCommand) != "" {
+		buildCommand = s.cfg.BuildCommand
 	}
-	buildCommand = "run " + buildCommand
-	args := strings.Split(buildCommand, " ")
-	buildCmd := exec.Command(npm, args...)
+	buildCmd := exec.Command(npm, "run", buildCommand)
 	buildCmd.Dir = projectDir
+	buildCmd.Env = s.generateEnvVars()
+	buildCmd.Stdout = cmdLogFile
+	buildCmd.Stderr = cmdLogFile
+
+	// Add custom downloaded node directory to PATH
+	nodeBin := filepath.Dir(npm)
+	newPath := fmt.Sprintf("%s%c%s", nodeBin, os.PathListSeparator, os.Getenv("PATH"))
+	buildCmd.Env = append(buildCmd.Env, "PATH="+newPath)
+
 	s.logger.Debugf("Building with \"npm %s\"...", buildCommand)
 	err = buildCmd.Run()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error building. logs are available at %s. %w", cmdLogFile.Name(), err)
 	}
 
 	buildDir := "dist"
-	if !isStringRefEmpty(s.cfg.BuildDir) {
-		buildDir = *s.cfg.BuildDir
+	if strings.TrimSpace(s.cfg.BuildDir) != "" {
+		buildDir = s.cfg.BuildDir
 	}
 	buildDir = filepath.Join(projectDir, buildDir)
 	_, err = os.Stat(buildDir)
@@ -380,6 +413,21 @@ func (s *staticServerNodeServer) buildAndGetFS(ctx context.Context, nodeDir stri
 	}
 
 	return os.DirFS(buildDir), nil
+}
+
+func (s *staticServerNodeServer) generateEnvVars() []string {
+	envVars := []string{}
+	for _, envVar := range os.Environ() {
+		if strings.HasPrefix(envVar, "VIAM_") {
+			envVars = append(envVars, envVar)
+			envVars = append(envVars, "VITE_"+envVar)
+		}
+	}
+	for key, value := range s.cfg.EnvVars {
+		envVars = append(envVars, fmt.Sprintf("%s=%s", key, value))
+		envVars = append(envVars, fmt.Sprintf("VITE_%s=%s", key, value))
+	}
+	return envVars
 }
 
 func isStringRefEmpty(str *string) bool {
